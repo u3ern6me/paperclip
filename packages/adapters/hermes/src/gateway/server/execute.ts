@@ -86,6 +86,12 @@ const TERMINAL_STATUSES = new Set([
 
 const FAILURE_STATUSES = new Set(["failed", "error"]);
 const CANCELLED_STATUSES = new Set(["cancelled", "canceled", "stopped", "interrupted"]);
+/**
+ * Bounded wait for the authoritative run status when a terminal SSE frame
+ * omitted the confirmed session id. One bounded fetch sequence, no retry loop
+ * beyond what fetchFinalStatus already performs inside the deadline.
+ */
+const TERMINAL_STATUS_FILL_DEADLINE_MS = 5_000;
 const DEFAULT_HERMES_DASHBOARD_PORT = "9119";
 const HERMES_DASHBOARD_API_PATHS = new Set(["", "/", "/chat"]);
 
@@ -146,6 +152,16 @@ function apiUrl(baseUrl: URL, path: string): string {
 
 function issueIdFromContext(ctx: AdapterExecutionContext): string | null {
   return nonEmpty(ctx.context.taskId) ?? nonEmpty(ctx.context.issueId);
+}
+
+/**
+ * Optional explicit continuation target: a Hermes conversation session id
+ * chosen by the operator. Only ever used as the Hermes run body's
+ * `session_id`; it is never a credential, never sent as a header, and never
+ * replaces the Paperclip session key.
+ */
+function existingHermesSessionIdFromConfig(config: Record<string, unknown>): string | null {
+  return nonEmpty(config.existingHermesSessionId);
 }
 
 export function resolveSessionKey(input: {
@@ -267,11 +283,14 @@ function buildInput(ctx: AdapterExecutionContext, paperclipApiUrl: string | null
   // Stable session keys (issue/agent strategy) resume the same remote Hermes
   // conversation across runs; a stored session id from a prior run means that
   // conversation already received the task brief, so pick the compact
-  // task-context variant under the shared resume rules.
+  // task-context variant under the shared resume rules. An explicitly
+  // selected existing Hermes conversation is also a continuation: the brief
+  // already lives in that conversation, so use the compact variant too.
   const sessionKeyStrategy = normalizeSessionKeyStrategy(ctx.config.sessionKeyStrategy);
   const resumedSession =
-    (sessionKeyStrategy === "issue" || sessionKeyStrategy === "agent") &&
-    Boolean(nonEmpty(ctx.runtime?.sessionId));
+    Boolean(existingHermesSessionIdFromConfig(ctx.config)) ||
+    ((sessionKeyStrategy === "issue" || sessionKeyStrategy === "agent") &&
+      Boolean(nonEmpty(ctx.runtime?.sessionId)));
   const taskMarkdown = nonEmpty(selectPaperclipTaskMarkdown(ctx.context, { resumedSession }));
   const wakePrompt = renderPaperclipWakePrompt(ctx.context.paperclipWake, {
     conversationMode: ctx.context.conversationMode === true,
@@ -323,6 +342,9 @@ function buildInput(ctx: AdapterExecutionContext, paperclipApiUrl: string | null
 function buildRunBody(ctx: AdapterExecutionContext, sessionKey: string | null): Record<string, unknown> {
   const paperclipApiUrl = nonEmpty(ctx.config.paperclipApiUrl);
   const payloadTemplate = parseObject(ctx.config.payloadTemplate);
+  // An explicitly selected existing Hermes conversation wins over the derived
+  // Paperclip session key; without it the default strategy addressing applies.
+  const existingSessionId = existingHermesSessionIdFromConfig(ctx.config);
   const configuredInput = nonEmpty(payloadTemplate.input);
   const input = configuredInput && ctx.context.conversationMode === true
     ? `${configuredInput}\n\n${buildInput(ctx, paperclipApiUrl)}`
@@ -335,7 +357,11 @@ function buildRunBody(ctx: AdapterExecutionContext, sessionKey: string | null): 
     ...payloadTemplate,
     input,
     instructions,
-    ...(sessionKey ? { session_id: sessionKey } : {}),
+    ...(existingSessionId
+      ? { session_id: existingSessionId }
+      : sessionKey
+        ? { session_id: sessionKey }
+        : {}),
   };
 }
 
@@ -452,6 +478,11 @@ function markTerminal(state: ExecutionState, terminal: TerminalState): void {
   if (state.terminal) return;
   state.terminal = terminal;
   state.resolveTerminal(terminal);
+}
+
+/** Redaction placeholder markers must never be persisted as session ids. */
+function isRedactionPlaceholder(value: string): boolean {
+  return /\[redacted/i.test(value);
 }
 
 function extractStatus(value: unknown): string | null {
@@ -664,14 +695,40 @@ export function mapFinalResultForTest(input: {
   sessionKey: string | null;
   strategy: SessionKeyStrategy;
   redactText?: TextRedactor;
+  /** Explicitly selected existing Hermes conversation id, when configured. */
+  existingSessionId?: string | null;
+  /** Prior run's session params; used only to preserve an already-confirmed tip. */
+  previousSessionParams?: Record<string, unknown> | null;
 }): AdapterExecutionResult {
   const redactText = input.redactText ?? sanitizeSensitiveText;
   const payload = input.terminal.payload ?? {};
   const output = redactText(
     input.terminal.output ?? extractOutput(payload) ?? input.outputChunks.join("").trim(),
   );
-  const sessionId = extractSessionId(payload) ?? input.sessionKey;
-  const sessionDisplayId = sessionId ? redactText(sessionId) : null;
+  const payloadSessionId = extractSessionId(payload);
+  const sessionId = payloadSessionId ?? input.sessionKey;
+  // Guard C: a redaction placeholder (e.g. a Paperclip session key rewritten by
+  // the redactor) is not an id and must never be persisted or echoed as one.
+  // The placeholder only exists AFTER redaction, so test the redacted form.
+  const effectiveSessionId =
+    sessionId && !isRedactionPlaceholder(redactText(sessionId)) ? sessionId : null;
+  const sessionDisplayId = effectiveSessionId ? redactText(effectiveSessionId) : null;
+  // The tip is only ever a Hermes-confirmed session id echoed back by a
+  // terminal payload. A session id that the redactor had to rewrite (for
+  // example a Paperclip session key echoed back) is not a confirmed Hermes
+  // tip and must not be stored. Acceptance of the run create request (202)
+  // is not confirmation, and neither is the id we sent.
+  const confirmedTip =
+    payloadSessionId && sessionDisplayId === payloadSessionId ? payloadSessionId : null;
+  // The explicitly selected conversation id is stored separately as the
+  // canonical target; the confirmed tip lives in the legacy hermesSessionId
+  // slot. When the terminal payload carries no session id, the last
+  // confirmed tip is preserved instead of being silently dropped.
+  const canonicalSessionId = nonEmpty(input.existingSessionId);
+  const previousTip = canonicalSessionId
+    ? nonEmpty(input.previousSessionParams?.hermesSessionId)
+    : null;
+  const hermesSessionId = confirmedTip ?? previousTip;
   const mapped = terminalResultCode(input.terminal.status);
   const usage = parseUsage(payload);
   const costUsd = parseCostUsd(payload);
@@ -692,7 +749,8 @@ export function mapFinalResultForTest(input: {
     sessionId: sessionDisplayId,
     sessionParams: {
       hermesRunId: input.terminal.runId,
-      ...(sessionId && sessionDisplayId === sessionId ? { hermesSessionId: sessionId } : {}),
+      ...(hermesSessionId ? { hermesSessionId } : {}),
+      ...(canonicalSessionId ? { hermesCanonicalSessionId: canonicalSessionId } : {}),
       strategy: input.strategy,
     },
     sessionDisplayId,
@@ -834,6 +892,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     runId: ctx.runId,
     issueId: issueIdFromContext(ctx),
   });
+  const existingSessionId = existingHermesSessionIdFromConfig(ctx.config);
+  if (existingSessionId && /^paperclip:/i.test(existingSessionId)) {
+    // Misuse guard: the explicit continuation target must be a Hermes session
+    // id, never a Paperclip session key, credential, or header value.
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: "hermes_gateway_existing_session_invalid",
+      errorMessage: "existingHermesSessionId must be a Hermes session id, not a Paperclip session key.",
+    };
+  }
   const extraHeaders = parseHeaders(ctx.config.headers);
   const runHeaders = buildHeaders({
     apiKey,
@@ -869,6 +939,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       eventReconnectMs: reconnectMs,
       sessionKeyStrategy: strategy,
       hasSessionKey: Boolean(sessionKey),
+      hasExistingHermesSessionId: Boolean(existingSessionId),
     },
   });
   await ctx.onLog("stdout", `[hermes-gateway] creating run at ${createRunUrl} (timeout=${timeoutSec}s, session=${strategy})\n`);
@@ -936,6 +1007,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (outcome === "timeout") {
     await stopRun({ ctx, baseUrl, headers: eventHeaders, runId, redactText });
     const finalStatus = await fetchFinalStatus({ baseUrl, headers: eventHeaders, runId, deadlineMs: STOP_GRACE_MS });
+    // On timeout the run is not confirmed complete. The tip is only refreshed
+    // from a terminal run-status session id (which is Hermes-confirmed data);
+    // otherwise the last confirmed tip is preserved. Without an explicitly
+    // selected session the params stay exactly as before.
+    let timeoutTip: string | null = null;
+    if (existingSessionId) {
+      const finalSessionId = extractSessionId(finalStatus);
+      timeoutTip =
+        finalSessionId && redactText(finalSessionId) === finalSessionId
+          ? finalSessionId
+          : nonEmpty(ctx.runtime?.sessionParams?.hermesSessionId);
+    }
     return {
       exitCode: 1,
       signal: null,
@@ -951,17 +1034,51 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       },
       sessionParams: {
         hermesRunId: runId,
+        ...(timeoutTip ? { hermesSessionId: timeoutTip } : {}),
+        ...(existingSessionId ? { hermesCanonicalSessionId: existingSessionId } : {}),
         strategy,
       },
       sessionDisplayId: sessionKey ? redactText(sessionKey) : null,
     };
   }
 
+  // A terminal SSE frame may omit the Hermes-confirmed session id (observed on
+  // run.failed). The run-status endpoint is the authoritative terminal payload:
+  // fill ONLY missing fields from it — never overwrite richer SSE data with
+  // empty GET fields.
+  let terminal = outcome;
+  if (
+    existingSessionId &&
+    !extractSessionId((terminal as TerminalState).payload ?? {})
+  ) {
+    const authoritative = await fetchFinalStatus({
+      baseUrl,
+      headers: eventHeaders,
+      runId,
+      deadlineMs: TERMINAL_STATUS_FILL_DEADLINE_MS,
+    });
+    if (authoritative && extractStatus(authoritative) === (terminal as TerminalState).status) {
+      terminal = {
+        ...(terminal as TerminalState),
+        payload: {
+          ...(terminal as TerminalState).payload,
+          ...Object.fromEntries(
+            Object.entries(authoritative).filter(
+              ([key, value]) => value !== null && value !== undefined && (terminal as TerminalState).payload?.[key] === undefined,
+            ),
+          ),
+        },
+      };
+    }
+  }
+
   return mapFinalResultForTest({
-    terminal: outcome,
+    terminal,
     outputChunks: state.outputChunks,
     sessionKey,
     strategy,
     redactText,
+    existingSessionId,
+    previousSessionParams: ctx.runtime?.sessionParams ?? null,
   });
 }
